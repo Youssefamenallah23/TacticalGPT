@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 from dataclasses import asdict
 from pathlib import Path
@@ -11,6 +12,7 @@ from tqdm.auto import tqdm
 from dataset import TacticsDataset
 from model import GPT, GPTConfig
 from utils import ensure_dirs, get_device, latest_checkpoint, save_checkpoint, set_seed
+from wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log
 
 
 def make_loaders(dataset, batch_size: int, val_fraction: float, num_workers: int, seed: int, device: str):
@@ -72,6 +74,13 @@ def evaluate(model, loader, device: str, max_batches: int = 50) -> float | None:
     return sum(losses) / max(1, len(losses))
 
 
+def append_jsonl(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", default="data/tactics_corpus.txt")
@@ -96,11 +105,14 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=0, help="0 means train for all epochs")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--no_resume", action="store_true")
+    add_wandb_args(parser)
     args = parser.parse_args()
 
     set_seed(args.seed)
     ensure_dirs(args.out_dir)
+    metrics_path = Path(args.out_dir) / "metrics.jsonl"
     device = get_device()
     use_amp = device == "cuda"
     print("Device:", device)
@@ -131,6 +143,22 @@ def main() -> None:
     print(f"Validation windows: {val_size:,}")
     print(f"Optimization steps planned: {planned_steps:,}")
     print(f"Effective batch size: {args.batch_size * args.grad_accum_steps:,}")
+
+    wandb_run = init_wandb(
+        args,
+        "pretrain",
+        {
+            "stage": "pretrain",
+            "args": vars(args),
+            "model": asdict(config),
+            "dataset_documents": dataset.num_documents,
+            "dataset_tokens": dataset.num_tokens,
+            "dataset_windows": len(dataset),
+            "train_windows": train_size,
+            "val_windows": val_size,
+            "planned_steps": planned_steps,
+        },
+    )
 
     model = GPT(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
@@ -181,11 +209,46 @@ def main() -> None:
 
             global_step += 1
             progress.set_postfix(loss=f"{loss.item():.4f}", step=global_step, lr=f"{lr:.2e}")
+            if args.log_every > 0 and global_step % args.log_every == 0:
+                append_jsonl(metrics_path, {
+                    "stage": "pretrain",
+                    "step": global_step,
+                    "epoch": epoch + 1,
+                    "train_loss": float(loss.item()),
+                    "lr": float(lr),
+                })
+                wandb_log(
+                    wandb_run,
+                    {
+                        "pretrain/train_loss": float(loss.item()),
+                        "pretrain/lr": float(lr),
+                        "pretrain/epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
 
             should_eval = val_loader is not None and args.eval_every > 0 and global_step % args.eval_every == 0
             if should_eval:
                 val_loss = evaluate(model, val_loader, device, args.eval_batches)
+                val_ppl = math.exp(min(val_loss, 20))
                 print(f"\\nValidation loss at step {global_step}: {val_loss:.4f}")
+                append_jsonl(metrics_path, {
+                    "stage": "pretrain",
+                    "step": global_step,
+                    "epoch": epoch + 1,
+                    "val_loss": float(val_loss),
+                    "val_perplexity": float(val_ppl),
+                    "best_val_loss": float(min(best_val_loss, val_loss)),
+                })
+                wandb_log(
+                    wandb_run,
+                    {
+                        "pretrain/val_loss": float(val_loss),
+                        "pretrain/val_perplexity": float(val_ppl),
+                        "pretrain/best_val_loss": float(min(best_val_loss, val_loss)),
+                    },
+                    step=global_step,
+                )
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_path = Path(args.out_dir) / "checkpoint_best.pt"
@@ -198,9 +261,36 @@ def main() -> None:
                 print("\\nSaved", path)
 
             if args.max_steps and global_step >= args.max_steps:
+                if val_loader is not None and (args.eval_every <= 0 or global_step % args.eval_every != 0):
+                    val_loss = evaluate(model, val_loader, device, args.eval_batches)
+                    val_ppl = math.exp(min(val_loss, 20))
+                    append_jsonl(metrics_path, {
+                        "stage": "pretrain",
+                        "step": global_step,
+                        "epoch": epoch + 1,
+                        "val_loss": float(val_loss),
+                        "val_perplexity": float(val_ppl),
+                        "best_val_loss": float(min(best_val_loss, val_loss)),
+                        "final": True,
+                    })
+                    wandb_log(
+                        wandb_run,
+                        {
+                            "pretrain/val_loss": float(val_loss),
+                            "pretrain/val_perplexity": float(val_ppl),
+                            "pretrain/best_val_loss": float(min(best_val_loss, val_loss)),
+                        },
+                        step=global_step,
+                    )
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_path = Path(args.out_dir) / "checkpoint_best.pt"
+                        save_checkpoint(str(best_path), model, optimizer, global_step, epoch, args.tokenizer, asdict(config), best_val_loss)
+                        print("Saved new best checkpoint:", best_path)
                 final_path = Path(args.out_dir) / f"checkpoint_step_{global_step}.pt"
                 save_checkpoint(str(final_path), model, optimizer, global_step, epoch, args.tokenizer, asdict(config), best_val_loss)
                 print("\\nReached max_steps. Saved", final_path)
+                wandb_finish(wandb_run)
                 return
 
         # Save at the end of every epoch so progress survives Colab runtime resets.
@@ -208,11 +298,39 @@ def main() -> None:
         save_checkpoint(str(epoch_path), model, optimizer, global_step, epoch + 1, args.tokenizer, asdict(config), best_val_loss)
         print("\\nSaved end-of-epoch checkpoint:", epoch_path)
 
+    if val_loader is not None and (args.eval_every <= 0 or global_step % args.eval_every != 0):
+        val_loss = evaluate(model, val_loader, device, args.eval_batches)
+        val_ppl = math.exp(min(val_loss, 20))
+        append_jsonl(metrics_path, {
+            "stage": "pretrain",
+            "step": global_step,
+            "epoch": args.epochs,
+            "val_loss": float(val_loss),
+            "val_perplexity": float(val_ppl),
+            "best_val_loss": float(min(best_val_loss, val_loss)),
+            "final": True,
+        })
+        wandb_log(
+            wandb_run,
+            {
+                "pretrain/val_loss": float(val_loss),
+                "pretrain/val_perplexity": float(val_ppl),
+                "pretrain/best_val_loss": float(min(best_val_loss, val_loss)),
+            },
+            step=global_step,
+        )
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_path = Path(args.out_dir) / "checkpoint_best.pt"
+            save_checkpoint(str(best_path), model, optimizer, global_step, args.epochs, args.tokenizer, asdict(config), best_val_loss)
+            print("Saved new best checkpoint:", best_path)
+
     final_path = Path(args.out_dir) / f"checkpoint_step_{global_step}.pt"
     save_checkpoint(str(final_path), model, optimizer, global_step, args.epochs, args.tokenizer, asdict(config), best_val_loss)
     print("Training complete. Saved", final_path)
     if best_val_loss < float("inf"):
         print(f"Best validation loss: {best_val_loss:.4f}")
+    wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":

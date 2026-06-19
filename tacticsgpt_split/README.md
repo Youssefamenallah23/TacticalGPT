@@ -22,6 +22,20 @@ This folder splits the original all-in-one notebook into three runnable Colab no
 
 The `scripts/` folder contains the `.py` files extracted from the notebooks.
 
+Optional experiment tracking is available in all three training stages. Install W&B with:
+
+```bash
+pip install wandb
+```
+
+Then add `--wandb_project TacticsGPT` plus a stage-specific `--wandb_run_name` to the pretrain, SFT, and RL commands. The scripts log loss/LR curves, SFT/pretrain perplexity, and GRPO reward curves. They also write local metrics JSONL files under `checkpoints/<stage>/metrics.jsonl`.
+
+After training, summarize the resume numbers with:
+
+```bash
+python src/summarize_metrics.py
+```
+
 The `data_generation/` folder contains sanitized data-generation notebooks/scripts:
 
 - `01_pretrain_data_generator_nvidia_sanitized.*`

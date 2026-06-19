@@ -30,7 +30,7 @@ Each stage teaches the model something new. Pretraining gives it football langua
 |---|---|
 | Google Colab (GPU runtime) | The model needs CUDA. Free T4 is enough for most stages. |
 | Google Drive | Checkpoints are saved there so they survive Colab restarts. |
-| Python packages | `torch`, `tokenizers`, `tqdm`, `numpy` — installed in Cell 0. |
+| Python packages | `torch`, `tokenizers`, `tqdm`, `numpy`, optional `wandb` — installed in Cell 0. |
 
 ### The One Rule You Must Not Break
 
@@ -115,6 +115,7 @@ The pretraining script (`src/train_pretrain.py`) runs with these settings by def
 - **Sliding window** over documents with stride 128, so long documents generate multiple overlapping training windows
 - **5% of data** held out as a validation set
 - **Mixed precision (AMP)** on CUDA for speed
+- Optional W&B tracking with `--wandb_project`, logging train loss, LR schedule, validation loss, and validation perplexity
 - Checkpoint saved every 250 steps; best validation loss checkpoint saved separately
 
 The script resumes automatically from the latest `checkpoints/pretrain/checkpoint_step_*.pt`. If Colab disconnects mid-run, just re-run the cell — it picks up where it left off.
@@ -166,6 +167,7 @@ The trainer is `src/train_sft_lora.py`. A short smoke-test run is provided (Cell
 - AdamW optimiser, low learning rate suitable for fine-tuning
 - Only the LoRA adapter weights have `requires_grad = True`
 - Resumes from the latest `checkpoints/sft/sft_step_*.pt`
+- Optional validation split with periodic eval loss/perplexity logging to local JSONL and W&B
 
 ---
 
@@ -198,6 +200,8 @@ The RL prompts live in `data/rl_prompts.jsonl`, built from the instruction field
 | `--save_every` | 25 | How often to save a recovery checkpoint |
 
 Increasing `TOTAL_STEPS` and rerunning the cell continues training — the script resumes from the latest `rl_step_*.pt` automatically.
+
+The RL trainer writes `checkpoints/rl/metrics.jsonl` and, when W&B is enabled, logs policy loss, LR, train reward, eval reward, best eval reward, and GRPO reward improvement percentage.
 
 ---
 
@@ -271,7 +275,7 @@ TacticsGPT_Phase1_Full_Pretrain/         ← Google Drive project root
 
 Follow these steps in order. Each step only needs to be done once per fresh project folder:
 
-- [ ] **Cell 0** — Install dependencies (`pip install tokenizers tqdm numpy torch`)
+- [ ] **Cell 0** — Install dependencies (`pip install tokenizers tqdm numpy torch wandb`)
 - [ ] **Cell 1** — Mount Google Drive and set `PROJECT_DIR`
 - [ ] **Cell 2** — Upload raw corpus or confirm `data/tactics_corpus.txt` exists
 - [ ] **Cell 3** — Write all `src/` scripts (run once per session or after editing)
@@ -295,6 +299,30 @@ Colab sessions reset. That is why every stage saves to Google Drive. When you re
 3. Jump directly to the stage you want to continue
 
 You do **not** need to rerun the corpus, tokenizer, or earlier training stages. The scripts detect existing checkpoints and resume automatically.
+
+---
+
+## Experiment Tracking and Resume Metrics
+
+Enable Weights & Biases by adding the same project flag to each training command:
+
+```bash
+--wandb_project TacticsGPT --wandb_run_name pretrain-run-1
+```
+
+Use different run names for pretraining, SFT, and RL. The scripts still run normally without this flag.
+
+Local metrics are also written to:
+
+- `checkpoints/pretrain/metrics.jsonl`
+- `checkpoints/sft/metrics.jsonl`
+- `checkpoints/rl/metrics.jsonl`
+
+After training, print the final eval numbers and a resume-ready bullet:
+
+```bash
+python src/summarize_metrics.py
+```
 
 ---
 

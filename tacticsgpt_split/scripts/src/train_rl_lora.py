@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 from model import GPT, GPTConfig
 from train_sft_lora import apply_lora, lora_state_dict
+from wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log
 
 
 ALLOWED_FORMATIONS = {
@@ -720,6 +721,14 @@ def append_jsonl(path, obj):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def reward_improvement_pct(current_reward, baseline_reward):
+    if baseline_reward is None or not math.isfinite(baseline_reward):
+        return None
+    if abs(baseline_reward) < 1e-8:
+        return None
+    return 100.0 * (current_reward - baseline_reward) / abs(baseline_reward)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rl_data", default="data/rl_prompts.jsonl")
@@ -745,6 +754,7 @@ def main():
     ap.add_argument("--eval_temperature", type=float, default=0.65)
     ap.add_argument("--eval_top_k", type=int, default=40)
     ap.add_argument("--seed", type=int, default=42)
+    add_wandb_args(ap)
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -762,6 +772,17 @@ def main():
     print("Base:", base_path)
     print("SFT:", sft_path)
     print("Reward mode: GRPO-style group-relative advantage, SFT-reference keyword matching, strict optional formations.")
+
+    wandb_run = init_wandb(
+        args,
+        "rl_grpo",
+        {
+            "stage": "rl_grpo",
+            "args": vars(args),
+            "base_checkpoint": base_path,
+            "sft_checkpoint": sft_path,
+        },
+    )
 
     base_state = torch.load(base_path, map_location=device)
     sft_state = torch.load(sft_path, map_location=device)
@@ -790,6 +811,7 @@ def main():
     reward_history = []
     eval_history = []
     top_k = []
+    baseline_eval_reward = None
 
     resume = args.resume_checkpoint or latest_step_checkpoint(args.out_dir, "rl_step_*.pt")
     if resume:
@@ -804,6 +826,8 @@ def main():
         reward_history = ckpt.get("reward_history", [])
         eval_history = ckpt.get("eval_history", [])
         top_k = ckpt.get("top_k", [])
+        if eval_history:
+            baseline_eval_reward = float(eval_history[0].get("avg_reward", eval_history[0].get("eval_reward")))
         print("Resume state:", {"step": step, "best_eval_reward": best_eval_reward, "top_k": top_k})
 
     pbar = tqdm(total=args.steps, initial=step, desc="RL GRPO-style")
@@ -890,7 +914,10 @@ def main():
         if args.eval_every > 0 and step % args.eval_every == 0:
             eval_result = evaluate_policy(model, tokenizer, dataset.prompts, reference_index, device, args)
             eval_reward = float(eval_result["avg_reward"])
-            eval_history.append({"step": step, **eval_result})
+            if baseline_eval_reward is None:
+                baseline_eval_reward = eval_reward
+            improvement = reward_improvement_pct(eval_reward, baseline_eval_reward)
+            eval_history.append({"step": step, "reward_improvement_pct": improvement, **eval_result})
 
             if eval_reward > best_eval_reward + args.min_delta:
                 best_eval_reward = eval_reward
@@ -946,7 +973,31 @@ def main():
             if eval_result:
                 record["eval_reward"] = eval_result["avg_reward"]
                 record["eval_top_reasons"] = eval_result["top_reasons"]
+                record["reward_improvement_pct"] = reward_improvement_pct(
+                    float(eval_result["avg_reward"]),
+                    baseline_eval_reward,
+                )
             append_jsonl(metrics_path, record)
+            wandb_record = {
+                "rl/loss": float(loss.item()),
+                "rl/lr": float(optimizer.param_groups[0]["lr"]),
+                "rl/current_reward": current_reward,
+                "rl/avg_train_reward": avg_train_reward,
+                "rl/recent_avg_reward_25": recent_avg,
+            }
+            if math.isfinite(best_eval_reward):
+                wandb_record["rl/best_eval_reward"] = best_eval_reward
+            if eval_result:
+                wandb_record.update({
+                    "rl/eval_reward": float(eval_result["avg_reward"]),
+                    "rl/eval_min_reward": float(eval_result["min_reward"]),
+                    "rl/eval_max_reward": float(eval_result["max_reward"]),
+                    "rl/eval_samples": int(eval_result["samples"]),
+                })
+                improvement = reward_improvement_pct(float(eval_result["avg_reward"]), baseline_eval_reward)
+                if improvement is not None:
+                    wandb_record["rl/reward_improvement_pct"] = float(improvement)
+            wandb_log(wandb_run, wandb_record, step=step)
 
             print(
                 "\nLOG",
@@ -989,6 +1040,11 @@ def main():
     if math.isfinite(best_eval_reward):
         print("Best eval reward:", best_eval_reward)
         print("Best model:", out_dir / "best_model" / "checkpoint_best.pt")
+        if baseline_eval_reward is not None:
+            improvement = reward_improvement_pct(best_eval_reward, baseline_eval_reward)
+            if improvement is not None:
+                print(f"Best reward improvement: {improvement:.2f}%")
+    wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":

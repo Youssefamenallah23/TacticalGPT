@@ -1,14 +1,15 @@
-import argparse, json, glob, os, re
+import argparse, json, glob, os, re, math
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm.auto import tqdm
 
 from model import GPT, GPTConfig
+from wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log
 
 
 def latest_step_checkpoint(folder, pattern):
@@ -67,6 +68,18 @@ def lora_state_dict(model):
     return {k: v.cpu() for k, v in model.state_dict().items() if "lora_" in k}
 
 
+def sft_checkpoint_payload(model, optimizer, step, epoch, base_ckpt, config, best_eval_loss):
+    return {
+        "lora_state_dict": lora_state_dict(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": step,
+        "epoch": epoch,
+        "base_checkpoint": base_ckpt,
+        "config": config,
+        "best_eval_loss": best_eval_loss,
+    }
+
+
 class SFTDataset(Dataset):
     def __init__(self, path, tokenizer_path, context_length=256):
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
@@ -121,6 +134,36 @@ class SFTDataset(Dataset):
         return torch.tensor(xs), torch.tensor(ys)
 
 
+@torch.no_grad()
+def evaluate(model, loader, device, max_batches):
+    if loader is None:
+        return None, None
+
+    was_training = model.training
+    model.eval()
+    losses = []
+    for i, (x, y) in enumerate(loader):
+        if i >= max_batches:
+            break
+        x, y = x.to(device), y.to(device)
+        logits, _ = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
+        losses.append(loss.item())
+
+    if was_training:
+        model.train()
+
+    avg_loss = sum(losses) / max(1, len(losses))
+    return avg_loss, math.exp(min(avg_loss, 20))
+
+
+def append_jsonl(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sft_data", default="data/sft_dataset.jsonl")
@@ -132,12 +175,20 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--context_length", type=int, default=256)
     ap.add_argument("--save_every", type=int, default=100)
+    ap.add_argument("--eval_every", type=int, default=100)
+    ap.add_argument("--eval_batches", type=int, default=50)
+    ap.add_argument("--val_fraction", type=float, default=0.05)
+    ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--r", type=int, default=8)
     ap.add_argument("--alpha", type=int, default=16)
     ap.add_argument("--dropout", type=float, default=0.05)
+    add_wandb_args(ap)
     args = ap.parse_args()
 
+    torch.manual_seed(args.seed)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    metrics_path = Path(args.out_dir) / "metrics.jsonl"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     base_ckpt = args.base_checkpoint or find_base_checkpoint()
@@ -151,12 +202,43 @@ def main():
     model = apply_lora(model, args.r, args.alpha, args.dropout).to(device)
 
     dataset = SFTDataset(args.sft_data, args.tokenizer, args.context_length)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate)
+    val_size = max(1, int(len(dataset) * args.val_fraction)) if args.val_fraction > 0 and len(dataset) > 20 else 0
+    train_size = len(dataset) - val_size
+    if val_size:
+        generator = torch.Generator().manual_seed(args.seed)
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+    else:
+        train_dataset = dataset
+        val_dataset = None
+
+    loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate)
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=dataset.collate)
+
+    print(f"SFT samples: {len(dataset):,}")
+    print(f"SFT train samples: {train_size:,}")
+    print(f"SFT validation samples: {val_size:,}")
+
+    wandb_run = init_wandb(
+        args,
+        "sft",
+        {
+            "stage": "sft",
+            "args": vars(args),
+            "base_checkpoint": base_ckpt,
+            "model": state["config"],
+            "samples": len(dataset),
+            "train_samples": train_size,
+            "val_samples": val_size,
+        },
+    )
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
     step = 0
     start_epoch = 0
+    best_eval_loss = float("inf")
     resume = latest_step_checkpoint(args.out_dir, "sft_step_*.pt")
     if resume:
         print("Resuming SFT:", resume)
@@ -165,6 +247,7 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         step = ckpt["step"]
         start_epoch = ckpt["epoch"]
+        best_eval_loss = ckpt.get("best_eval_loss", best_eval_loss)
 
     model.train()
     for epoch in range(start_epoch, args.epochs):
@@ -182,29 +265,103 @@ def main():
 
             step += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}", step=step)
+            if args.log_every > 0 and step % args.log_every == 0:
+                append_jsonl(metrics_path, {
+                    "stage": "sft",
+                    "step": step,
+                    "epoch": epoch + 1,
+                    "train_loss": float(loss.item()),
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                })
+                wandb_log(
+                    wandb_run,
+                    {
+                        "sft/train_loss": float(loss.item()),
+                        "sft/lr": float(optimizer.param_groups[0]["lr"]),
+                        "sft/epoch": epoch + 1,
+                    },
+                    step=step,
+                )
+
+            if val_loader is not None and args.eval_every > 0 and step % args.eval_every == 0:
+                eval_loss, eval_ppl = evaluate(model, val_loader, device, args.eval_batches)
+                print(f"\nSFT eval loss at step {step}: {eval_loss:.4f}")
+                print(f"SFT eval perplexity at step {step}: {eval_ppl:.2f}")
+                append_jsonl(metrics_path, {
+                    "stage": "sft",
+                    "step": step,
+                    "epoch": epoch + 1,
+                    "eval_loss": float(eval_loss),
+                    "eval_perplexity": float(eval_ppl),
+                    "best_eval_loss": float(min(best_eval_loss, eval_loss)),
+                })
+                wandb_log(
+                    wandb_run,
+                    {
+                        "sft/eval_loss": float(eval_loss),
+                        "sft/eval_perplexity": float(eval_ppl),
+                        "sft/best_eval_loss": float(min(best_eval_loss, eval_loss)),
+                    },
+                    step=step,
+                )
+                if eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    best_path = Path(args.out_dir) / "sft_best.pt"
+                    torch.save(
+                        sft_checkpoint_payload(model, optimizer, step, epoch, base_ckpt, state["config"], best_eval_loss),
+                        best_path,
+                    )
+                    print("Saved best SFT:", best_path)
 
             if step % args.save_every == 0:
                 path = Path(args.out_dir) / f"sft_step_{step}.pt"
-                torch.save({
-                    "lora_state_dict": lora_state_dict(model),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "step": step,
-                    "epoch": epoch,
-                    "base_checkpoint": base_ckpt,
-                    "config": state["config"],
-                }, path)
+                torch.save(
+                    sft_checkpoint_payload(model, optimizer, step, epoch, base_ckpt, state["config"], best_eval_loss),
+                    path,
+                )
                 print("Saved", path)
 
+    if val_loader is not None and (args.eval_every <= 0 or step % args.eval_every != 0):
+        eval_loss, eval_ppl = evaluate(model, val_loader, device, args.eval_batches)
+        print(f"\nFinal SFT eval loss: {eval_loss:.4f}")
+        print(f"Final SFT perplexity: {eval_ppl:.2f}")
+        append_jsonl(metrics_path, {
+            "stage": "sft",
+            "step": step,
+            "epoch": args.epochs,
+            "eval_loss": float(eval_loss),
+            "eval_perplexity": float(eval_ppl),
+            "best_eval_loss": float(min(best_eval_loss, eval_loss)),
+            "final": True,
+        })
+        wandb_log(
+            wandb_run,
+            {
+                "sft/eval_loss": float(eval_loss),
+                "sft/eval_perplexity": float(eval_ppl),
+                "sft/best_eval_loss": float(min(best_eval_loss, eval_loss)),
+            },
+            step=step,
+        )
+        if eval_loss < best_eval_loss:
+            best_eval_loss = eval_loss
+            best_path = Path(args.out_dir) / "sft_best.pt"
+            torch.save(
+                sft_checkpoint_payload(model, optimizer, step, args.epochs, base_ckpt, state["config"], best_eval_loss),
+                best_path,
+            )
+            print("Saved best SFT:", best_path)
+
     final = Path(args.out_dir) / f"sft_step_{step}.pt"
-    torch.save({
-        "lora_state_dict": lora_state_dict(model),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "step": step,
-        "epoch": args.epochs,
-        "base_checkpoint": base_ckpt,
-        "config": state["config"],
-    }, final)
+    torch.save(
+        sft_checkpoint_payload(model, optimizer, step, args.epochs, base_ckpt, state["config"], best_eval_loss),
+        final,
+    )
     print("Saved final SFT:", final)
+    if best_eval_loss < float("inf"):
+        print(f"Best SFT eval loss: {best_eval_loss:.4f}")
+        print(f"Best SFT perplexity: {math.exp(min(best_eval_loss, 20)):.2f}")
+    wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":
